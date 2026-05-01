@@ -651,6 +651,29 @@ async function handleSubscriptionRequest(request, user, customDomain, piu, ipv4E
         finalLinks.push(errorLink);
     }
 
+    const expireForName = url.searchParams.get('expire');
+
+if (expireForName && Number.isFinite(Number(expireForName))) {
+    const expireText = new Date(Number(expireForName)).toLocaleString('zh-CN', {
+        timeZone: 'Asia/Shanghai',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false
+    }).replace(/\//g, '-');
+
+    for (let i = 0; i < finalLinks.length; i++) {
+        if (finalLinks[i].startsWith('vless://') || finalLinks[i].startsWith('trojan://')) {
+            const parts = finalLinks[i].split('#');
+            const oldName = parts[1] ? decodeURIComponent(parts[1]) : '节点';
+            finalLinks[i] = parts[0] + '#' + encodeURIComponent(oldName + ' 到期时间:' + expireText);
+        }
+    }
+}
+    
     let subscriptionContent;
     let contentType = 'text/plain; charset=utf-8';
     
