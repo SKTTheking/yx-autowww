@@ -1481,7 +1481,7 @@ if (validDays) {
     }
 
     const expireTime = Date.now() + days * 24 * 60 * 60 * 1000;
-    expireParam = `&expire=${expireTime}`;
+    expireParam = '&expire=' + expireTime;
 }
 
             let subscriptionUrl = \`\${baseUrl}/\${uuid}/sub?domain=\${encodeURIComponent(domain)}&epd=\${switches.switchDomain ? 'yes' : 'no'}&epi=\${switches.switchIP ? 'yes' : 'no'}&egi=\${switches.switchGitHub ? 'yes' : 'no'}\`;
