@@ -1222,6 +1222,12 @@ function generateHomePage(scuValue) {
             </div>
             
             <div class="form-group">
+    <label>有效天数（可选）</label>
+    <input type="number" id="validDays" placeholder="例如：3，表示3天后过期" min="1">
+    <small>留空则不过期；填写后生成的订阅链接到期自动失效</small>
+</div>
+            
+            <div class="form-group">
                 <label>WebSocket路径（可选）</label>
                 <input type="text" id="customPath" placeholder="留空则使用默认路径 /" value="/">
                 <small style="display: block; margin-top: 6px; color: #86868b; font-size: 13px;">自定义WebSocket路径，例如：/v2ray 或 /</small>
@@ -1462,7 +1468,25 @@ function generateHomePage(scuValue) {
             
             const currentUrl = new URL(window.location.href);
             const baseUrl = currentUrl.origin;
+
+            const validDays = document.getElementById('validDays')?.value.trim();
+let expireParam = '';
+
+if (validDays) {
+    const days = parseInt(validDays, 10);
+
+    if (isNaN(days) || days < 1) {
+        alert('有效天数必须是大于 0 的数字');
+        return;
+    }
+
+    const expireTime = Date.now() + days * 24 * 60 * 60 * 1000;
+    expireParam = `&expire=${expireTime}`;
+}
+
             let subscriptionUrl = \`\${baseUrl}/\${uuid}/sub?domain=\${encodeURIComponent(domain)}&epd=\${switches.switchDomain ? 'yes' : 'no'}&epi=\${switches.switchIP ? 'yes' : 'no'}&egi=\${switches.switchGitHub ? 'yes' : 'no'}\`;
+
+            if (expireParam) subscriptionUrl += expireParam;
             
             // 添加GitHub优选URL
             if (githubUrl) {
@@ -1658,6 +1682,32 @@ export default {
             if (!domain) {
                 return new Response('缺少域名参数', { status: 400 });
             }
+
+            const expire = url.searchParams.get('expire');
+
+if (expire) {
+    const expireTime = Number(expire);
+
+    if (!Number.isFinite(expireTime)) {
+        return new Response('过期时间参数错误', {
+            status: 400,
+            headers: {
+                'Content-Type': 'text/plain; charset=utf-8',
+                'Cache-Control': 'no-store'
+            }
+        });
+    }
+
+    if (Date.now() > expireTime) {
+        return new Response('订阅已过期，请重新生成', {
+            status: 403,
+            headers: {
+                'Content-Type': 'text/plain; charset=utf-8',
+                'Cache-Control': 'no-store'
+            }
+        });
+    }
+}
             
             // 从URL参数获取配置
             epd = url.searchParams.get('epd') !== 'no';
