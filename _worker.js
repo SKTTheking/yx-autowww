@@ -160,6 +160,14 @@ async function fetchLiveCandidates(regions, preferredISPs = []) {
   }
 }
 
+function utf8ToBytes(s) {
+  return unescape(encodeURIComponent(s));
+}
+
+function bytesToUtf8(s) {
+  try { return decodeURIComponent(escape(s)); } catch (_) { return s; }
+}
+
 function decodeName(link) {
   if (link.startsWith('vmess://')) {
     try {
@@ -170,6 +178,27 @@ function decodeName(link) {
   const i = link.indexOf('#');
   if (i < 0) return '';
   try { return decodeURIComponent(link.slice(i + 1)); } catch (_) { return link.slice(i + 1); }
+}
+
+// 过滤外部优选源中混入的推广/广告节点。
+function isBlockedPromotionalLink(link) {
+  const raw = String(link || '');
+  const lower = raw.toLowerCase();
+  const name = decodeName(raw).toLowerCase();
+
+  if (name.includes('加入频道') || name.includes('kejiland00')) return true;
+  if (lower.includes('saas.sin.fan') || lower.includes('kejiland00')) return true;
+
+  if (raw.startsWith('vmess://')) {
+    try {
+      const obj = JSON.parse(bytesToUtf8(atob(raw.slice(8))));
+      const host = String(obj.add || '').toLowerCase();
+      const ps = String(obj.ps || '').toLowerCase();
+      if (host === 'saas.sin.fan' || ps.includes('加入频道') || ps.includes('kejiland00')) return true;
+    } catch (_) {}
+  }
+
+  return false;
 }
 
 function isNative(link) {
@@ -207,14 +236,6 @@ function rewriteURI(link, candidate) {
   return `${rewritten}#${encodeURIComponent(newName)}`;
 }
 
-function utf8ToBytes(s) {
-  return unescape(encodeURIComponent(s));
-}
-
-function bytesToUtf8(s) {
-  try { return decodeURIComponent(escape(s)); } catch (_) { return s; }
-}
-
 function rewriteVMess(link, candidate) {
   try {
     const obj = JSON.parse(bytesToUtf8(atob(link.slice(8))));
@@ -227,13 +248,14 @@ function rewriteVMess(link, candidate) {
 }
 
 function buildCandidateLinks(baseLinks, candidates) {
-  const native = baseLinks.filter(isNative);
+  const cleanBaseLinks = baseLinks.filter(link => !isBlockedPromotionalLink(link));
+  const native = cleanBaseLinks.filter(isNative);
   const generated = [];
 
   for (const candidate of candidates) {
     // 优先使用同运营商的节点当模板；跨运营商回退时没有同运营商模板，就复用现有协议模板。
-    let templates = baseLinks.filter(link => !isNative(link) && linkISP(link) === candidate.isp);
-    if (!templates.length) templates = baseLinks.filter(link => !isNative(link));
+    let templates = cleanBaseLinks.filter(link => !isNative(link) && linkISP(link) === candidate.isp);
+    if (!templates.length) templates = cleanBaseLinks.filter(link => !isNative(link));
 
     const uniqueTemplateKinds = new Map();
     for (const t of templates) {
@@ -267,23 +289,39 @@ function encodeSubscription(links) {
   return btoa(links.join('\n'));
 }
 
+function filteredBase64Response(baseResponse, links) {
+  const headers = new Headers(baseResponse.headers);
+  headers.set('Cache-Control', 'no-store');
+  headers.set('X-YX-Promo-Filter', 'enabled');
+  return new Response(encodeSubscription(links.filter(link => !isBlockedPromotionalLink(link))), {
+    status: baseResponse.status,
+    headers
+  });
+}
+
 async function regionalizeSubscription(request, env, baseResponse) {
   if (!baseResponse.ok) return baseResponse;
   const url = new URL(request.url);
   const requested = normalizeRegion(url.searchParams.get('region'));
-  if (requested === 'all') return baseResponse;
+
+  const body = await baseResponse.text();
+  let links = decodeSubscription(body);
+  if (!links.length) return new Response(body, baseResponse);
+
+  // 无论是否启用地区优选，都先清除推广节点。
+  links = links.filter(link => !isBlockedPromotionalLink(link));
+
+  if (requested === 'all') {
+    return filteredBase64Response(baseResponse, links);
+  }
 
   let selected = requested;
   if (requested === 'auto') {
     const domain = url.searchParams.get('domain');
     const detected = await detectOriginRegion(domain, env);
     selected = detected.region;
-    if (selected === 'all') return baseResponse;
+    if (selected === 'all') return filteredBase64Response(baseResponse, links);
   }
-
-  const body = await baseResponse.text();
-  const links = decodeSubscription(body);
-  if (!links.length) return new Response(body, baseResponse);
 
   const native = links.filter(isNative);
   const fallbackOrder = REGION_FALLBACKS[selected] || [selected];
@@ -297,6 +335,7 @@ async function regionalizeSubscription(request, env, baseResponse) {
       headers.set('Cache-Control', 'no-store');
       headers.set('X-YX-Region', region);
       headers.set('X-YX-Region-Source', 'live-base');
+      headers.set('X-YX-Promo-Filter', 'enabled');
       return new Response(encodeSubscription(out), { status: baseResponse.status, headers });
     }
   }
@@ -316,6 +355,7 @@ async function regionalizeSubscription(request, env, baseResponse) {
       headers.set('Cache-Control', 'no-store');
       headers.set('X-YX-Region', firstRegion);
       headers.set('X-YX-Region-Source', 'wetest-live-same-isp');
+      headers.set('X-YX-Promo-Filter', 'enabled');
       return new Response(encodeSubscription(out), { status: baseResponse.status, headers });
     }
   }
@@ -333,6 +373,7 @@ async function regionalizeSubscription(request, env, baseResponse) {
       headers.set('Cache-Control', 'no-store');
       headers.set('X-YX-Region', firstRegion);
       headers.set('X-YX-Region-Source', 'wetest-live-cross-isp');
+      headers.set('X-YX-Promo-Filter', 'enabled');
       return new Response(encodeSubscription(out), { status: baseResponse.status, headers });
     }
   }
@@ -343,10 +384,11 @@ async function regionalizeSubscription(request, env, baseResponse) {
     headers.set('Cache-Control', 'no-store');
     headers.set('X-YX-Region', selected);
     headers.set('X-YX-Region-Source', 'native-only');
+    headers.set('X-YX-Promo-Filter', 'enabled');
     return new Response(encodeSubscription(native), { status: baseResponse.status, headers });
   }
 
-  return baseResponse;
+  return filteredBase64Response(baseResponse, links);
 }
 
 export default {
