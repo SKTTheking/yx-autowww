@@ -391,11 +391,28 @@ async function regionalizeSubscription(request, env, baseResponse) {
   return filteredBase64Response(baseResponse, links);
 }
 
+function removePublicFooter(response) {
+  const contentType = (response.headers.get('content-type') || '').toLowerCase();
+  if (!contentType.includes('text/html')) return response;
+
+  return new HTMLRewriter()
+    .on('.footer', {
+      element(element) {
+        element.remove();
+      }
+    })
+    .transform(response);
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const isSub = /^\/[^/]+\/sub$/.test(url.pathname);
-    if (!isSub) return baseWorker.fetch(request, env, ctx);
+
+    if (!isSub) {
+      const pageResponse = await baseWorker.fetch(request, env, ctx);
+      return removePublicFooter(pageResponse);
+    }
 
     // 原项目继续负责有效期、协议、TLS/ECH、客户端格式等全部既有功能。
     const baseResponse = await baseWorker.fetch(request, env, ctx);
