@@ -12,6 +12,7 @@ const COUNTRY_TO_REGION = {
   JP: 'jp', HK: 'hk', SG: 'sg', KR: 'kr', TW: 'tw'
 };
 
+// 自动模式的亚洲回退顺序：不再回退美国节点。
 const REGION_FALLBACKS = {
   jp: ['jp', 'hk', 'sg'],
   hk: ['hk', 'jp', 'sg'],
@@ -107,11 +108,23 @@ function isIPv4(ip) {
   return ip.split('.').every(x => Number(x) >= 0 && Number(x) <= 255);
 }
 
-async function fetchHistoricalCandidates(region, isps) {
-  const allowed = REGION_COLOS[region] || [];
-  if (!allowed.length) return [];
+function extractDataCell(row, label) {
+  const safe = String(label).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`<td[^>]*data-label=["']${safe}["'][^>]*>([\\s\\S]*?)<\\/td>`, 'i');
+  const m = row.match(re);
+  return m ? cleanCell(m[1]) : '';
+}
+
+// 只读取 WeTest 当前实时优选页，不再使用历史数据中心 IP。
+// preferredISPs 为空时表示允许跨运营商取当前仍在线的亚洲候选。
+async function fetchLiveCandidates(regions, preferredISPs = []) {
+  const wantedColos = new Set(
+    regions.flatMap(region => REGION_COLOS[region] || []).map(x => String(x).toUpperCase())
+  );
+  if (!wantedColos.size) return [];
+
   try {
-    const res = await fetchWithTimeout('https://www.wetest.vip/page/cloudflare/colo.html', {
+    const res = await fetchWithTimeout('https://www.wetest.vip/page/cloudflare/address_v4.html', {
       headers: { 'User-Agent': 'Mozilla/5.0' }
     }, 4500);
     if (!res.ok) return [];
@@ -120,20 +133,20 @@ async function fetchHistoricalCandidates(region, isps) {
     const out = [];
 
     for (const row of rows) {
-      const cells = [...row.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)].map(m => cleanCell(m[1]));
-      if (cells.length < 7) continue;
-      const colo = String(cells[0] || '').toUpperCase();
-      if (!allowed.includes(colo)) continue;
-      const candidates = [
-        { isp: '移动', ip: cells[4] },
-        { isp: '联通', ip: cells[5] },
-        { isp: '电信', ip: cells[6] }
-      ];
-      for (const c of candidates) {
-        const ip = cleanCell(c.ip);
-        if (isps.includes(c.isp) && isIPv4(ip)) out.push({ ...c, ip, colo });
-      }
+      const isp = extractDataCell(row, '线路名称');
+      const ip = extractDataCell(row, '优选地址');
+      const colo = extractDataCell(row, '数据中心').toUpperCase();
+      if (!isp || !isIPv4(ip) || !wantedColos.has(colo)) continue;
+      if (preferredISPs.length && !preferredISPs.includes(isp)) continue;
+      out.push({ isp, ip, colo, live: true });
     }
+
+    // 按 regions 的优先顺序排序，例如日本 -> 香港 -> 新加坡。
+    const rank = new Map();
+    regions.forEach((region, index) => {
+      for (const colo of REGION_COLOS[region] || []) rank.set(colo, index);
+    });
+    out.sort((a, b) => (rank.get(a.colo) ?? 999) - (rank.get(b.colo) ?? 999));
 
     const seen = new Set();
     return out.filter(x => {
@@ -213,24 +226,30 @@ function rewriteVMess(link, candidate) {
   }
 }
 
-function buildHistoricalLinks(baseLinks, candidates) {
+function buildCandidateLinks(baseLinks, candidates) {
   const native = baseLinks.filter(isNative);
   const generated = [];
+
   for (const candidate of candidates) {
+    // 优先使用同运营商的节点当模板；跨运营商回退时没有同运营商模板，就复用现有协议模板。
     let templates = baseLinks.filter(link => !isNative(link) && linkISP(link) === candidate.isp);
     if (!templates.length) templates = baseLinks.filter(link => !isNative(link));
+
     const uniqueTemplateKinds = new Map();
     for (const t of templates) {
       const name = decodeName(t);
-      const kind = t.startsWith('vmess://') ? `vmess|${name.includes('-80-') ? '80' : 'tls'}` :
-        `${t.split('://')[0]}|${(t.match(/:(\d+)\?/) || [])[1] || ''}`;
+      const kind = t.startsWith('vmess://')
+        ? `vmess|${name.includes('-80-') ? '80' : 'tls'}`
+        : `${t.split('://')[0]}|${(t.match(/:(\d+)\?/) || [])[1] || ''}`;
       if (!uniqueTemplateKinds.has(kind)) uniqueTemplateKinds.set(kind, t);
     }
+
     for (const t of uniqueTemplateKinds.values()) {
       const rewritten = t.startsWith('vmess://') ? rewriteVMess(t, candidate) : rewriteURI(t, candidate);
       if (rewritten) generated.push(rewritten);
     }
   }
+
   return [...native, ...generated];
 }
 
@@ -269,7 +288,7 @@ async function regionalizeSubscription(request, env, baseResponse) {
   const native = links.filter(isNative);
   const fallbackOrder = REGION_FALLBACKS[selected] || [selected];
 
-  // 第一优先：使用当前实时优选列表中已经命中目标/邻近地区的节点。
+  // 1) 先用原项目已经抓到的当前实时节点，严格按 日本→香港→新加坡 等顺序挑选。
   for (const region of fallbackOrder) {
     const live = links.filter(link => !isNative(link) && hasRegionColo(link, region));
     if (live.length) {
@@ -277,27 +296,48 @@ async function regionalizeSubscription(request, env, baseResponse) {
       const headers = new Headers(baseResponse.headers);
       headers.set('Cache-Control', 'no-store');
       headers.set('X-YX-Region', region);
-      headers.set('X-YX-Region-Source', 'live');
+      headers.set('X-YX-Region-Source', 'live-base');
       return new Response(encodeSubscription(out), { status: baseResponse.status, headers });
     }
   }
 
-  // 实时列表没有时，按 日本→香港→新加坡（或当前地区优先）读取 WeTest 历史地区候选。
-  const isps = enabledISPs(url);
-  for (const region of fallbackOrder) {
-    const candidates = await fetchHistoricalCandidates(region, isps);
-    if (!candidates.length) continue;
-    const out = buildHistoricalLinks(links, candidates);
+  const selectedISPs = enabledISPs(url);
+
+  // 2) 再直接读取 WeTest 当前实时页，先尊重用户选择的运营商。
+  const sameISPLive = await fetchLiveCandidates(fallbackOrder, selectedISPs);
+  if (sameISPLive.length) {
+    // 只使用优先级最高、当前有结果的那个地区，不混多个地区。
+    const firstColo = sameISPLive[0].colo;
+    const firstRegion = fallbackOrder.find(r => (REGION_COLOS[r] || []).includes(firstColo)) || selected;
+    const candidates = sameISPLive.filter(x => (REGION_COLOS[firstRegion] || []).includes(x.colo));
+    const out = buildCandidateLinks(links, candidates);
     if (out.length > native.length) {
       const headers = new Headers(baseResponse.headers);
       headers.set('Cache-Control', 'no-store');
-      headers.set('X-YX-Region', region);
-      headers.set('X-YX-Region-Source', 'wetest-history');
+      headers.set('X-YX-Region', firstRegion);
+      headers.set('X-YX-Region-Source', 'wetest-live-same-isp');
       return new Response(encodeSubscription(out), { status: baseResponse.status, headers });
     }
   }
 
-  // 严格禁止自动回退到美国 LAX/SJC：只保留原生节点，避免误导成“日本优选”。
+  // 3) 如果所选运营商当前只有 LAX 之类美国节点，则允许跨运营商使用“当前实时”的亚洲 IP。
+  //    例如联通当前无日本/香港实时结果，但移动当前有 HKG，则使用 HKG，而不是使用一年前的历史 NRT IP。
+  const anyISPLive = await fetchLiveCandidates(fallbackOrder, []);
+  if (anyISPLive.length) {
+    const firstColo = anyISPLive[0].colo;
+    const firstRegion = fallbackOrder.find(r => (REGION_COLOS[r] || []).includes(firstColo)) || selected;
+    const candidates = anyISPLive.filter(x => (REGION_COLOS[firstRegion] || []).includes(x.colo));
+    const out = buildCandidateLinks(links, candidates);
+    if (out.length > native.length) {
+      const headers = new Headers(baseResponse.headers);
+      headers.set('Cache-Control', 'no-store');
+      headers.set('X-YX-Region', firstRegion);
+      headers.set('X-YX-Region-Source', 'wetest-live-cross-isp');
+      return new Response(encodeSubscription(out), { status: baseResponse.status, headers });
+    }
+  }
+
+  // 4) 亚洲实时页真的一个候选都没有时，只保留原生地址；绝不偷偷回退 LAX/SJC。
   if (native.length) {
     const headers = new Headers(baseResponse.headers);
     headers.set('Cache-Control', 'no-store');
@@ -305,6 +345,7 @@ async function regionalizeSubscription(request, env, baseResponse) {
     headers.set('X-YX-Region-Source', 'native-only');
     return new Response(encodeSubscription(native), { status: baseResponse.status, headers });
   }
+
   return baseResponse;
 }
 
@@ -314,10 +355,10 @@ export default {
     const isSub = /^\/[^/]+\/sub$/.test(url.pathname);
     if (!isSub) return baseWorker.fetch(request, env, ctx);
 
-    // 先让原项目继续负责有效期、协议、TLS/ECH、客户端格式等全部既有功能。
+    // 原项目继续负责有效期、协议、TLS/ECH、客户端格式等全部既有功能。
     const baseResponse = await baseWorker.fetch(request, env, ctx);
 
-    // 只有原生 base64 订阅需要在这里做地区筛选；外部订阅转换器最终也会来取这个地址。
+    // 外部订阅转换器最终会回取这个原生订阅，因此这里只处理原生 base64 订阅。
     if (url.searchParams.has('target')) return baseResponse;
     return regionalizeSubscription(request, env, baseResponse);
   }
