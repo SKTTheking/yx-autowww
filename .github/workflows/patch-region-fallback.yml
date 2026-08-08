@@ -1,0 +1,170 @@
+name: Patch regional fallback logic
+
+on:
+  push:
+    paths:
+      - '.github/workflows/patch-region-fallback.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch _worker.js
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('_worker.js')
+          s = path.read_text(encoding='utf-8')
+
+          helper = r'''
+// 当当前优选页没有目标地区时，从 WeTest 数据中心历史候选表中补充对应地区/运营商候选。
+// 注意：Cloudflare 是 Anycast，这些是“地区候选”而不是永久固定机房；用于避免目标为日本时直接回退美国 LAX。
+async function fetchHistoricalRegionalIPs(preferredRegion, ispMobile = true, ispUnicom = true, ispTelecom = true, ipv4Enabled = true) {
+    const region = normalizePreferredRegion(preferredRegion);
+    const allowedColos = REGION_COLOS[region] || [];
+    if (!ipv4Enabled || region === 'all' || region === 'auto' || allowedColos.length === 0) return [];
+
+    try {
+        const response = await fetchWithTimeout('https://www.wetest.vip/page/cloudflare/colo.html', {
+            headers: { 'User-Agent': 'Mozilla/5.0' }
+        }, 4000);
+        if (!response.ok) return [];
+
+        const html = await response.text();
+        const rows = html.match(/<tr[\s\S]*?<\/tr>/gi) || [];
+        const candidates = [];
+        const clean = value => String(value || '')
+            .replace(/<[^>]*>/g, '')
+            .replace(/&nbsp;/gi, ' ')
+            .replace(/&amp;/gi, '&')
+            .trim();
+        const isIPv4 = value => /^(?:\d{1,3}\.){3}\d{1,3}$/.test(value);
+
+        for (const row of rows) {
+            const cells = [...row.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)].map(m => clean(m[1]));
+            if (cells.length < 7) continue;
+
+            const colo = String(cells[0] || '').toUpperCase();
+            if (!allowedColos.includes(colo)) continue;
+
+            const entries = [
+                { enabled: ispMobile, isp: '移动', ip: cells[4] },
+                { enabled: ispUnicom, isp: '联通', ip: cells[5] },
+                { enabled: ispTelecom, isp: '电信', ip: cells[6] }
+            ];
+
+            for (const entry of entries) {
+                const ip = clean(entry.ip);
+                if (entry.enabled && isIPv4(ip)) {
+                    candidates.push({ isp: entry.isp, ip, colo, historicalRegionCandidate: true });
+                }
+            }
+        }
+
+        const seen = new Set();
+        return candidates.filter(item => {
+            const key = `${item.isp}|${item.ip}|${item.colo}`;
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        });
+    } catch (error) {
+        console.error('读取地区历史候选失败:', error?.message || error);
+        return [];
+    }
+}
+'''
+
+          marker = '// 获取动态IP列表（支持IPv4/IPv6、运营商和地区筛选）'
+          if 'async function fetchHistoricalRegionalIPs(' not in s:
+              if marker not in s:
+                  raise SystemExit('helper insertion marker not found')
+              s = s.replace(marker, helper + '\n' + marker, 1)
+
+          old = """                if (regionalResults.length > 0) {
+                    results = regionalResults;
+                } else {
+                    console.warn(`地区 ${REGION_LABELS[region] || region} 暂无可用优选 IP，已回退到全部动态优选 IP`);
+                }
+"""
+          new = """                if (regionalResults.length > 0) {
+                    results = regionalResults;
+                } else {
+                    const historicalCandidates = await fetchHistoricalRegionalIPs(
+                        region,
+                        ispMobile,
+                        ispUnicom,
+                        ispTelecom,
+                        ipv4Enabled
+                    );
+                    if (historicalCandidates.length > 0) {
+                        results = historicalCandidates;
+                        console.warn(`地区 ${REGION_LABELS[region] || region} 当前优选暂无结果，已使用对应运营商的地区候选 IP`);
+                    } else {
+                        // 严格地区模式：宁可不返回动态优选，也不把日本/香港等请求回退成美国 LAX。
+                        results = [];
+                        console.warn(`地区 ${REGION_LABELS[region] || region} 暂无候选 IP，已禁止跨地区回退`);
+                    }
+                }
+"""
+          if old in s:
+              s = s.replace(old, new, 1)
+          elif '已禁止跨地区回退' not in s:
+              raise SystemExit('regional fallback block not found')
+
+          endpoint_anchor = '        // 测试优选API API: /test-optimize-api?url=xxx&port=443\n'
+          endpoint = r'''        // 诊断真实源站与自动地区：/detect-origin?domain=example.com
+        if (path === '/detect-origin') {
+            const domain = url.searchParams.get('domain');
+            if (!domain) {
+                return new Response(JSON.stringify({ success: false, error: '缺少 domain 参数' }), {
+                    status: 400,
+                    headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }
+                });
+            }
+            const info = await detectPreferredRegionFromOrigin(domain, env);
+            return new Response(JSON.stringify({
+                success: !!info.originIP,
+                domain,
+                originIP: info.originIP,
+                countryCode: info.countryCode,
+                country: info.country,
+                city: info.city,
+                preferredRegion: info.region,
+                preferredRegionName: REGION_LABELS[info.region] || info.region
+            }, null, 2), {
+                headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }
+            });
+        }
+
+'''
+          if "path === '/detect-origin'" not in s:
+              if endpoint_anchor not in s:
+                  raise SystemExit('endpoint insertion anchor not found')
+              s = s.replace(endpoint_anchor, endpoint + endpoint_anchor, 1)
+
+          path.write_text(s, encoding='utf-8')
+          PY
+
+      - name: Syntax check
+        run: node --input-type=module --check < _worker.js
+
+      - name: Commit patch
+        shell: bash
+        run: |
+          if git diff --quiet -- _worker.js; then
+            echo "No changes needed"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add _worker.js
+          git commit -m "Fix regional fallback to avoid LAX"
+          git push
