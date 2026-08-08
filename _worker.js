@@ -1,6 +1,7 @@
 // Cloudflare Worker - 简化版优选工具
 // 仅保留优选域名、优选IP、GitHub、上报和节点生成功能
 // 修复记录：已修正 VMess 协议下节点名称包含中文导致 Error 1101 的问题
+// 新增：Cloudflare DNS 真实源站识别 + 日本/香港/新加坡/韩国/台湾地区优选
 
 // 默认配置
 let customPreferredIPs = [];
@@ -35,6 +36,130 @@ const directDomains = [
 // 默认优选IP来源URL
 const defaultIPURL = 'https://raw.githubusercontent.com/qwer-search/bestip/refs/heads/main/kejilandbestip.txt';
 
+// 地区与 Cloudflare 数据中心映射
+const REGION_COLOS = {
+    jp: ['NRT', 'KIX', 'FUK', 'OKA'],
+    hk: ['HKG'],
+    sg: ['SIN'],
+    kr: ['ICN'],
+    tw: ['TPE']
+};
+
+const COUNTRY_TO_REGION = {
+    JP: 'jp',
+    HK: 'hk',
+    SG: 'sg',
+    KR: 'kr',
+    TW: 'tw'
+};
+
+const REGION_LABELS = {
+    auto: '自动',
+    all: '全部地区',
+    jp: '日本',
+    hk: '香港',
+    sg: '新加坡',
+    kr: '韩国',
+    tw: '台湾'
+};
+
+function normalizePreferredRegion(region) {
+    const value = String(region || 'all').trim().toLowerCase();
+    return ['auto', 'all', 'jp', 'hk', 'sg', 'kr', 'tw'].includes(value) ? value : 'all';
+}
+
+async function fetchWithTimeout(resource, options = {}, timeout = 3500) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeout);
+    try {
+        return await fetch(resource, { ...options, signal: controller.signal });
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+// 从 Cloudflare DNS 记录读取被橙云隐藏的真实源站 IP。
+// API Token 仅需要指定 Zone 的 DNS Read 权限。
+async function fetchOriginIPFromCloudflare(domain, env) {
+    const zoneId = env?.CF_ZONE_ID;
+    const apiToken = env?.CF_API_TOKEN;
+    if (!zoneId || !apiToken || !domain) return null;
+
+    let currentName = String(domain).trim().toLowerCase().replace(/\.$/, '');
+    if (!currentName) return null;
+
+    // 最多跟随 3 层同 Zone 内 CNAME，避免异常记录导致无限循环。
+    for (let depth = 0; depth < 3; depth++) {
+        try {
+            const apiUrl = `https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records?name=${encodeURIComponent(currentName)}&per_page=100`;
+            const response = await fetchWithTimeout(apiUrl, {
+                headers: {
+                    'Authorization': `Bearer ${apiToken}`,
+                    'Content-Type': 'application/json'
+                }
+            }, 4000);
+
+            if (!response.ok) return null;
+            const data = await response.json();
+            if (!data?.success || !Array.isArray(data.result)) return null;
+
+            const exactRecords = data.result.filter(record =>
+                String(record.name || '').toLowerCase().replace(/\.$/, '') === currentName
+            );
+
+            const ipv4Record = exactRecords.find(record => record.type === 'A' && record.content);
+            if (ipv4Record) return String(ipv4Record.content).trim();
+
+            const ipv6Record = exactRecords.find(record => record.type === 'AAAA' && record.content);
+            if (ipv6Record) return String(ipv6Record.content).trim();
+
+            const cnameRecord = exactRecords.find(record => record.type === 'CNAME' && record.content);
+            if (!cnameRecord) return null;
+            currentName = String(cnameRecord.content).trim().toLowerCase().replace(/\.$/, '');
+        } catch (error) {
+            console.error('读取 Cloudflare 源站 DNS 失败:', error?.message || error);
+            return null;
+        }
+    }
+
+    return null;
+}
+
+// 根据源站 IP 判断地区。仅识别常用亚洲地区；其他国家自动回退到全部地区。
+async function detectPreferredRegionFromOrigin(domain, env) {
+    const originIP = await fetchOriginIPFromCloudflare(domain, env);
+    if (!originIP) {
+        return { region: 'all', originIP: null, countryCode: '', country: '', city: '' };
+    }
+
+    try {
+        const geoUrl = `https://ipwho.is/${encodeURIComponent(originIP)}?fields=success,ip,country,country_code,region,city`;
+        const response = await fetchWithTimeout(geoUrl, {
+            headers: { 'User-Agent': 'yx-autowww/region-detect' }
+        }, 3500);
+        if (!response.ok) {
+            return { region: 'all', originIP, countryCode: '', country: '', city: '' };
+        }
+
+        const geo = await response.json();
+        if (geo?.success === false) {
+            return { region: 'all', originIP, countryCode: '', country: '', city: '' };
+        }
+
+        const countryCode = String(geo?.country_code || '').toUpperCase();
+        return {
+            region: COUNTRY_TO_REGION[countryCode] || 'all',
+            originIP,
+            countryCode,
+            country: geo?.country || '',
+            city: geo?.city || ''
+        };
+    } catch (error) {
+        console.error('源站 IP 地区识别失败:', error?.message || error);
+        return { region: 'all', originIP, countryCode: '', country: '', city: '' };
+    }
+}
+
 // UUID验证
 function isValidUUID(str) {
     const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -46,8 +171,8 @@ function getConfigValue(key, defaultValue) {
     return defaultValue || '';
 }
 
-// 获取动态IP列表（支持IPv4/IPv6和运营商筛选）
-async function fetchDynamicIPs(ipv4Enabled = true, ipv6Enabled = true, ispMobile = true, ispUnicom = true, ispTelecom = true) {
+// 获取动态IP列表（支持IPv4/IPv6、运营商和地区筛选）
+async function fetchDynamicIPs(ipv4Enabled = true, ipv6Enabled = true, ispMobile = true, ispUnicom = true, ispTelecom = true, preferredRegion = 'all') {
     const v4Url = "https://www.wetest.vip/page/cloudflare/address_v4.html";
     const v6Url = "https://www.wetest.vip/page/cloudflare/address_v6.html";
     let results = [];
@@ -77,6 +202,24 @@ async function fetchDynamicIPs(ipv4Enabled = true, ipv6Enabled = true, ispMobile
                 if (isp.includes('电信') && !ispTelecom) return false;
                 return true;
             });
+        }
+
+        // 按 Cloudflare 数据中心地区筛选。
+        // 如果 wetest 当前没有该地区可用结果，则回退到当前全部动态结果，避免订阅彻底不可用。
+        const region = normalizePreferredRegion(preferredRegion);
+        if (region !== 'all' && region !== 'auto' && results.length > 0) {
+            const allowedColos = REGION_COLOS[region] || [];
+            if (allowedColos.length > 0) {
+                const regionalResults = results.filter(item => {
+                    const colo = String(item.colo || '').trim().toUpperCase();
+                    return allowedColos.includes(colo);
+                });
+                if (regionalResults.length > 0) {
+                    results = regionalResults;
+                } else {
+                    console.warn(`地区 ${REGION_LABELS[region] || region} 暂无可用优选 IP，已回退到全部动态优选 IP`);
+                }
+            }
         }
         
         return results.length > 0 ? results : [];
@@ -116,7 +259,7 @@ async function fetchAndParseWetest(url) {
 
 // 整理成数组
 async function 整理成数组(内容) {
-    var 替换后的内容 = 内容.replace(/[	"'\r\n]+/g, ',').replace(/,+/g, ',');
+    var 替换后的内容 = 内容.replace(/[\t"'\r\n]+/g, ',').replace(/,+/g, ',');
     if (替换后的内容.charAt(0) == ',') 替换后的内容 = 替换后的内容.slice(1);
     if (替换后的内容.charAt(替换后的内容.length - 1) == ',') 替换后的内容 = 替换后的内容.slice(0, 替换后的内容.length - 1);
     const 地址数组 = 替换后的内容.split(',');
@@ -372,7 +515,7 @@ async function generateTrojanLinksFromSource(list, user, workerDomain, disableNo
                     sni: workerDomain, 
                     fp: 'chrome', 
                     type: 'ws', 
-                    host: workerDomain, 
+                    host: workerDomain,
                     path: wsPath
                 });
                 if (echConfig) {
@@ -497,13 +640,25 @@ function generateLinksFromNewIPs(list, user, workerDomain, customPath = '/', ech
 }
 
 // 生成订阅内容
-async function handleSubscriptionRequest(request, user, customDomain, piu, ipv4Enabled, ipv6Enabled, ispMobile, ispUnicom, ispTelecom, evEnabled, etEnabled, vmEnabled, disableNonTLS, customPath, echConfig = null) {
+async function handleSubscriptionRequest(request, user, customDomain, piu, ipv4Enabled, ipv6Enabled, ispMobile, ispUnicom, ispTelecom, evEnabled, etEnabled, vmEnabled, disableNonTLS, customPath, echConfig = null, preferredRegion = 'all', env = null) {
     const url = new URL(request.url);
     const finalLinks = [];
     const workerDomain = url.hostname;  // workerDomain始终是请求的hostname
     const nodeDomain = customDomain || url.hostname;  // 用户输入的域名用于生成节点时的host/sni
     const target = url.searchParams.get('target') || 'base64';
     const wsPath = customPath || '/';
+
+    let resolvedRegion = normalizePreferredRegion(preferredRegion);
+    let originRegionInfo = null;
+    if (resolvedRegion === 'auto') {
+        originRegionInfo = await detectPreferredRegionFromOrigin(nodeDomain, env);
+        resolvedRegion = originRegionInfo.region || 'all';
+        console.log(`自动地区优选: ${nodeDomain} -> ${originRegionInfo.countryCode || '未知'} -> ${REGION_LABELS[resolvedRegion] || resolvedRegion}`);
+    }
+
+    // 只要地区筛选已生效且优选IP开启，就只使用具有明确 colo 的 wetest 动态优选结果，
+    // 避免优选域名 / GitHub 列表中混入无法确认地区的节点。
+    const regionOnlyMode = resolvedRegion !== 'all' && epi;
 
     async function addNodesFromList(list) {
         // 确保至少有一个协议被启用
@@ -521,12 +676,14 @@ async function handleSubscriptionRequest(request, user, customDomain, piu, ipv4E
         }
     }
 
-    // 原生地址
-    const nativeList = [{ ip: workerDomain, isp: '原生地址' }];
-    await addNodesFromList(nativeList);
+    // 原生地址：地区筛选模式下不混入，以保证订阅尽量保持所选地区。
+    if (!regionOnlyMode) {
+        const nativeList = [{ ip: workerDomain, isp: '原生地址' }];
+        await addNodesFromList(nativeList);
+    }
 
-    // 优选域名
-    if (epd) {
+    // 优选域名：无法稳定判断实际落点，地区筛选模式下自动忽略。
+    if (epd && !regionOnlyMode) {
         const domainList = directDomains.map(d => ({ ip: d.domain, isp: d.name || d.domain }));
         await addNodesFromList(domainList);
     }
@@ -534,7 +691,7 @@ async function handleSubscriptionRequest(request, user, customDomain, piu, ipv4E
     // 优选IP
     if (epi) {
         try {
-            const dynamicIPList = await fetchDynamicIPs(ipv4Enabled, ipv6Enabled, ispMobile, ispUnicom, ispTelecom);
+            const dynamicIPList = await fetchDynamicIPs(ipv4Enabled, ipv6Enabled, ispMobile, ispUnicom, ispTelecom, resolvedRegion);
             if (dynamicIPList.length > 0) {
                 await addNodesFromList(dynamicIPList);
             }
@@ -543,8 +700,8 @@ async function handleSubscriptionRequest(request, user, customDomain, piu, ipv4E
         }
     }
 
-    // GitHub优选 / 优选API
-    if (egi) {
+    // GitHub优选 / 优选API：地区筛选模式下自动忽略，避免混入其他地区。
+    if (egi && !regionOnlyMode) {
         try {
             // 检查是否是优选API URL（以https://开头）
             if (piu && piu.toLowerCase().startsWith('https://')) {
@@ -697,11 +854,17 @@ if (expireForName && Number.isFinite(Number(expireForName))) {
             subscriptionContent = btoa(finalLinks.join('\n'));
     }
     
+    const responseHeaders = {
+        'Content-Type': contentType,
+        'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+        'X-Preferred-Region': resolvedRegion
+    };
+    if (originRegionInfo?.countryCode) {
+        responseHeaders['X-Origin-Country'] = originRegionInfo.countryCode;
+    }
+
     return new Response(subscriptionContent, {
-        headers: { 
-            'Content-Type': contentType,
-            'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
-        },
+        headers: responseHeaders,
     });
 }
 
@@ -864,7 +1027,8 @@ function generateHomePage(scuValue) {
         }
         
         .form-group input,
-        .form-group textarea {
+        .form-group textarea,
+        .form-group select {
             width: 100%;
             padding: 14px 16px;
             font-size: 17px;
@@ -876,10 +1040,12 @@ function generateHomePage(scuValue) {
             outline: none;
             transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
             -webkit-appearance: none;
+            appearance: none;
         }
         
         .form-group input:focus,
-        .form-group textarea:focus {
+        .form-group textarea:focus,
+        .form-group select:focus {
             background: rgba(142, 142, 147, 0.16);
             border-color: #007AFF;
             transform: scale(1.005);
@@ -1164,13 +1330,15 @@ function generateHomePage(scuValue) {
             }
             
             .form-group input,
-            .form-group textarea {
+            .form-group textarea,
+            .form-group select {
                 background: rgba(142, 142, 147, 0.2);
                 color: #f5f5f7;
             }
             
             .form-group input:focus,
-            .form-group textarea:focus {
+            .form-group textarea:focus,
+            .form-group select:focus {
                 background: rgba(142, 142, 147, 0.25);
                 border-color: #5ac8fa;
             }
@@ -1355,6 +1523,20 @@ function generateHomePage(scuValue) {
                     </label>
                 </div>
             </div>
+
+            <div class="form-group">
+                <label>优选地区</label>
+                <select id="preferredRegion">
+                    <option value="auto" selected>自动（按真实源站 IP）</option>
+                    <option value="jp">日本</option>
+                    <option value="hk">香港</option>
+                    <option value="sg">新加坡</option>
+                    <option value="kr">韩国</option>
+                    <option value="tw">台湾</option>
+                    <option value="all">全部地区（旧模式）</option>
+                </select>
+                <small>自动模式会读取 Cloudflare 中该域名的真实源站 IP，并自动匹配对应地区。地区模式下只使用可识别数据中心的动态优选 IP；识别失败或该地区暂时无结果时会自动回退。</small>
+            </div>
             
             <div class="list-item" onclick="toggleSwitch('switchTLS')" style="margin-top: 8px;">
                 <div>
@@ -1486,6 +1668,7 @@ function generateHomePage(scuValue) {
             const ispMobile = document.getElementById('ispMobile').checked;
             const ispUnicom = document.getElementById('ispUnicom').checked;
             const ispTelecom = document.getElementById('ispTelecom').checked;
+            const preferredRegion = document.getElementById('preferredRegion')?.value || 'auto';
             
             const githubUrl = document.getElementById('githubUrl').value.trim();
             
@@ -1507,7 +1690,7 @@ if (validDays) {
     expireParam = '&expire=' + expireTime;
 }
 
-            let subscriptionUrl = \`\${baseUrl}/\${uuid}/sub?domain=\${encodeURIComponent(domain)}&epd=\${switches.switchDomain ? 'yes' : 'no'}&epi=\${switches.switchIP ? 'yes' : 'no'}&egi=\${switches.switchGitHub ? 'yes' : 'no'}\`;
+            let subscriptionUrl = \`\${baseUrl}/\${uuid}/sub?domain=\${encodeURIComponent(domain)}&epd=\${switches.switchDomain ? 'yes' : 'no'}&epi=\${switches.switchIP ? 'yes' : 'no'}&egi=\${switches.switchGitHub ? 'yes' : 'no'}&region=\${encodeURIComponent(preferredRegion)}\`;
 
             if (expireParam) subscriptionUrl += expireParam;
             
@@ -1672,7 +1855,7 @@ export default {
             try {
                 const results = await 请求优选API([apiUrl], port, timeout);
                 return new Response(JSON.stringify({ 
-                    success: true, 
+                    success: true,
                     results: results,
                     total: results.length,
                     message: `成功获取 ${results.length} 个优选IP`
@@ -1684,7 +1867,7 @@ export default {
                 });
             } catch (error) {
                 return new Response(JSON.stringify({ 
-                    success: false, 
+                    success: false,
                     error: error.message 
                 }), {
                     status: 500,
@@ -1737,6 +1920,7 @@ if (expire) {
             epi = url.searchParams.get('epi') !== 'no';
             egi = url.searchParams.get('egi') !== 'no';
             const piu = url.searchParams.get('piu') || defaultIPURL;
+            const preferredRegion = normalizePreferredRegion(url.searchParams.get('region') || 'all');
             
             // 协议选择
             const evEnabled = url.searchParams.get('ev') === 'yes' || (url.searchParams.get('ev') === null && ev);
@@ -1764,7 +1948,7 @@ if (expire) {
             // 自定义路径
             const customPath = url.searchParams.get('path') || '/';
 
-            return await handleSubscriptionRequest(request, uuid, domain, piu, ipv4Enabled, ipv6Enabled, ispMobile, ispUnicom, ispTelecom, evEnabled, etEnabled, vmEnabled, disableNonTLS, customPath, echConfig);
+            return await handleSubscriptionRequest(request, uuid, domain, piu, ipv4Enabled, ipv6Enabled, ispMobile, ispUnicom, ispTelecom, evEnabled, etEnabled, vmEnabled, disableNonTLS, customPath, echConfig, preferredRegion, env);
         }
         
         return new Response('Not Found', { status: 404 });
