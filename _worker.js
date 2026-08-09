@@ -72,9 +72,12 @@ async function fetchOriginIP(domain, env) {
   return null;
 }
 
-async function detectOriginRegion(domain, env) {
-  const originIP = await fetchOriginIP(domain, env);
+async function detectOriginRegion(domain, env, manualOriginIP = '') {
+  // 公开给别人使用时，可手动填写真实源站 IP；填写后优先使用它，不需要对方提供 Cloudflare Token。
+  const suppliedIP = String(manualOriginIP || '').trim();
+  const originIP = suppliedIP || await fetchOriginIP(domain, env);
   if (!originIP) return { region: 'all', originIP: null };
+
   try {
     const res = await fetchWithTimeout(
       `https://ipwho.is/${encodeURIComponent(originIP)}?fields=success,country_code`,
@@ -141,7 +144,6 @@ async function fetchLiveCandidates(regions, preferredISPs = []) {
       out.push({ isp, ip, colo, live: true });
     }
 
-    // 按 regions 的优先顺序排序，例如日本 -> 香港 -> 新加坡。
     const rank = new Map();
     regions.forEach((region, index) => {
       for (const colo of REGION_COLOS[region] || []) rank.set(colo, index);
@@ -253,7 +255,6 @@ function buildCandidateLinks(baseLinks, candidates) {
   const generated = [];
 
   for (const candidate of candidates) {
-    // 优先使用同运营商的节点当模板；跨运营商回退时没有同运营商模板，就复用现有协议模板。
     let templates = cleanBaseLinks.filter(link => !isNative(link) && linkISP(link) === candidate.isp);
     if (!templates.length) templates = cleanBaseLinks.filter(link => !isNative(link));
 
@@ -308,7 +309,6 @@ async function regionalizeSubscription(request, env, baseResponse) {
   let links = decodeSubscription(body);
   if (!links.length) return new Response(body, baseResponse);
 
-  // 无论是否启用地区优选，都先清除推广节点。
   links = links.filter(link => !isBlockedPromotionalLink(link));
 
   if (requested === 'all') {
@@ -318,7 +318,8 @@ async function regionalizeSubscription(request, env, baseResponse) {
   let selected = requested;
   if (requested === 'auto') {
     const domain = url.searchParams.get('domain');
-    const detected = await detectOriginRegion(domain, env);
+    const manualOriginIP = url.searchParams.get('originIP') || '';
+    const detected = await detectOriginRegion(domain, env, manualOriginIP);
     selected = detected.region;
     if (selected === 'all') return filteredBase64Response(baseResponse, links);
   }
@@ -326,7 +327,7 @@ async function regionalizeSubscription(request, env, baseResponse) {
   const native = links.filter(isNative);
   const fallbackOrder = REGION_FALLBACKS[selected] || [selected];
 
-  // 1) 先用原项目已经抓到的当前实时节点，严格按 日本→香港→新加坡 等顺序挑选。
+  // 1) 先用原项目已经抓到的当前实时节点。
   for (const region of fallbackOrder) {
     const live = links.filter(link => !isNative(link) && hasRegionColo(link, region));
     if (live.length) {
@@ -342,10 +343,9 @@ async function regionalizeSubscription(request, env, baseResponse) {
 
   const selectedISPs = enabledISPs(url);
 
-  // 2) 再直接读取 WeTest 当前实时页，先尊重用户选择的运营商。
+  // 2) 再读取 WeTest 当前实时页，先尊重用户选择的运营商。
   const sameISPLive = await fetchLiveCandidates(fallbackOrder, selectedISPs);
   if (sameISPLive.length) {
-    // 只使用优先级最高、当前有结果的那个地区，不混多个地区。
     const firstColo = sameISPLive[0].colo;
     const firstRegion = fallbackOrder.find(r => (REGION_COLOS[r] || []).includes(firstColo)) || selected;
     const candidates = sameISPLive.filter(x => (REGION_COLOS[firstRegion] || []).includes(x.colo));
@@ -360,8 +360,7 @@ async function regionalizeSubscription(request, env, baseResponse) {
     }
   }
 
-  // 3) 如果所选运营商当前只有 LAX 之类美国节点，则允许跨运营商使用“当前实时”的亚洲 IP。
-  //    例如联通当前无日本/香港实时结果，但移动当前有 HKG，则使用 HKG，而不是使用一年前的历史 NRT IP。
+  // 3) 所选运营商没有亚洲实时节点时，允许跨运营商使用当前实时亚洲 IP。
   const anyISPLive = await fetchLiveCandidates(fallbackOrder, []);
   if (anyISPLive.length) {
     const firstColo = anyISPLive[0].colo;
@@ -378,7 +377,7 @@ async function regionalizeSubscription(request, env, baseResponse) {
     }
   }
 
-  // 4) 亚洲实时页真的一个候选都没有时，只保留原生地址；绝不偷偷回退 LAX/SJC。
+  // 4) 亚洲实时候选都没有时，只保留原生地址。
   if (native.length) {
     const headers = new Headers(baseResponse.headers);
     headers.set('Cache-Control', 'no-store');
@@ -391,17 +390,44 @@ async function regionalizeSubscription(request, env, baseResponse) {
   return filteredBase64Response(baseResponse, links);
 }
 
-function removePublicFooter(response) {
+async function customizePublicPage(response) {
   const contentType = (response.headers.get('content-type') || '').toLowerCase();
   if (!contentType.includes('text/html')) return response;
 
+  let html = await response.text();
+
+  // 在“域名”下面加入可选真实源站 IP。别人使用自己的橙云域名时可手动填写。
+  const domainBlock = `            <div class="form-group">\n                <label>域名</label>\n                <input type="text" id="domain" placeholder="请输入您的域名">\n            </div>`;
+  const originBlock = `${domainBlock}\n            \n            <div class="form-group">\n                <label>真实源站 IP（可选）</label>\n                <input type="text" id="originIP" placeholder="例如：150.230.196.94">\n                <small style="display: block; margin-top: 6px; color: #86868b; font-size: 13px;">自己的 Cloudflare 域名可留空自动检测；其他人的橙云域名请填写真实服务器 IP。</small>\n            </div>`;
+  if (html.includes(domainBlock) && !html.includes('id="originIP"')) {
+    html = html.replace(domainBlock, originBlock);
+  }
+
+  // 生成订阅链接时读取手动源站 IP。
+  const regionLine = `            const preferredRegion = document.getElementById('preferredRegion')?.value || 'auto';`;
+  if (html.includes(regionLine) && !html.includes("document.getElementById('originIP')")) {
+    html = html.replace(regionLine, `${regionLine}\n            const originIP = document.getElementById('originIP')?.value.trim() || '';`);
+  }
+
+  // 把手动源站 IP 加到订阅 URL。后端会优先按这个 IP 判断地区。
+  const expireLine = `            if (expireParam) subscriptionUrl += expireParam;`;
+  if (html.includes(expireLine) && !html.includes("subscriptionUrl += '&originIP='")) {
+    html = html.replace(expireLine, `            if (originIP) subscriptionUrl += '&originIP=' + encodeURIComponent(originIP);\n${expireLine}`);
+  }
+
+  const headers = new Headers(response.headers);
+  headers.set('Cache-Control', 'no-store');
+  headers.delete('Content-Length');
+  const modified = new Response(html, { status: response.status, headers });
+
+  // 同时删除页面底部原作者 footer。
   return new HTMLRewriter()
     .on('.footer', {
       element(element) {
         element.remove();
       }
     })
-    .transform(response);
+    .transform(modified);
 }
 
 export default {
@@ -411,7 +437,7 @@ export default {
 
     if (!isSub) {
       const pageResponse = await baseWorker.fetch(request, env, ctx);
-      return removePublicFooter(pageResponse);
+      return customizePublicPage(pageResponse);
     }
 
     // 原项目继续负责有效期、协议、TLS/ECH、客户端格式等全部既有功能。
