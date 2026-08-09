@@ -398,7 +398,7 @@ async function customizePublicPage(response) {
 
   // 在“域名”下面加入可选真实源站 IP。别人使用自己的橙云域名时可手动填写。
   const domainBlock = `            <div class="form-group">\n                <label>域名</label>\n                <input type="text" id="domain" placeholder="请输入您的域名">\n            </div>`;
-  const originBlock = `${domainBlock}\n            \n            <div class="form-group">\n                <label>真实源站 IP（可选）</label>\n                <input type="text" id="originIP" placeholder="例如：150.230.196.94">\n                <small style="display: block; margin-top: 6px; color: #86868b; font-size: 13px;">自己的 Cloudflare 域名可留空自动检测；其他人的橙云域名请填写真实服务器 IP。</small>\n            </div>`;
+  const originBlock = `${domainBlock}\n            \n            <div class="form-group">\n                <label>真实源站 IP（可选）</label>\n                <input type="text" id="originIP" placeholder="例如：203.0.113.10">\n                <small style="display: block; margin-top: 6px; color: #86868b; font-size: 13px;">自己的 Cloudflare 域名可留空自动检测；其他人的橙云域名请填写真实服务器 IP。</small>\n            </div>`;
   if (html.includes(domainBlock) && !html.includes('id="originIP"')) {
     html = html.replace(domainBlock, originBlock);
   }
